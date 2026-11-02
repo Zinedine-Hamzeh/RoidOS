@@ -275,7 +275,7 @@ look("Husk/Launcher.swift", """.background(Theme.accent, in: RoundedRectangle(co
 look("Husk/Launcher.swift", "userInterfaceIdiom == .pad ? 6 : 3)", "userInterfaceIdiom == .pad ? 4 : 2)", "home columns")
 look("Husk/Launcher.swift", "HuskLink(value: item.route) { HomeGameTile(item: item) }",
      "HuskLink(value: item.route) { HomeGameTile(item: item).padding(10).background(Console.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous)) }", "home tile card")
-look("Husk/Launcher.swift", '.font(.system(size: 30, weight: .bold, design: .rounded))', '.font(.system(size: 30, weight: .heavy, design: .serif))', "home title font")
+look("Husk/Launcher.swift", '.font(.system(size: 30, weight: .bold, design: .rounded))', '.font(.system(size: 30, weight: .heavy, design: .default))', "home title font")
 
 # Tabs: new names and icons.
 look("Husk/ContentView.swift", 'Label("Home", systemImage: "house.fill")', 'Label("Hub", systemImage: "circle.grid.2x2.fill")', "tab home")
