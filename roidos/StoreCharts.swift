@@ -241,7 +241,11 @@ struct StoreChartsView: View {
 
     @MainActor
     private func load() async {
-        guard let session = manager.session else { return }
+        guard let session = manager.session else {
+            failed = true
+            loading = false
+            return
+        }
         let wanted = kind
         loading = true
         failed = false
