@@ -1,0 +1,267 @@
+# Builds RoidOS on GitHub's cloud Macs and publishes RoidOS.ipa together with
+# the source code of that exact build. Start it from the Actions tab (works in
+# a phone browser).
+#
+# How: the app itself (every screen, the translation layer, the JIT helper and
+# the widget) is compiled here from the upstream source with roidos/rebrand.py
+# applied. The four engine libraries (QEMU, ANGLE, MoltenVK, the PS4 core) and
+# the Android runtime files are taken from the upstream release of the same
+# version: they take hours to cross-compile and carry no branding.
+#
+# No Apple certificate or provisioning profile is used anywhere here. The IPA
+# is signed ad hoc; SideStore/AltStore re-sign it with your own Apple ID.
+
+name: Build RoidOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream release to build (a release tag like 3.3; it must have a published IPA)"
+        type: string
+        default: "3.3"
+      publish_release:
+        description: "Publish RoidOS.ipa as a GitHub Release (easy download on iPhone; needed for in-app update notices)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-roidos
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  UPSTREAM_REPO: Leviidev/Husk
+
+jobs:
+  build:
+    # The upstream release is built with Xcode 27 (its Info.plist says so), and
+    # some of its SwiftUI only compiles against the iOS 27 SDK. GitHub's xcode-27
+    # image carries Xcode 27; macos-26 (Xcode 26.6) and macos-15 (Xcode 16) do not.
+    runs-on: xcode-27
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out this repo (RoidOS changes and icons)
+        uses: actions/checkout@v4
+
+      - name: Download upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: Leviidev/Husk
+          ref: ${{ inputs.upstream_ref }}
+          path: husk
+          fetch-depth: 1
+
+      - name: Select Xcode 27 (27.0 if present, like the upstream build)
+        run: |
+          XC=""
+          for c in /Applications/Xcode_27.0.0.app /Applications/Xcode_27.app \
+                   "$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | head -1)" \
+                   "$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"; do
+            if [ -n "$c" ] && [ -d "$c" ]; then XC="$c"; break; fi
+          done
+          [ -n "$XC" ] || { echo "::error::No Xcode 27 or 26 on this runner"; ls /Applications; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # Since Xcode 26 the Metal shader compiler is a separate download, and the
+      # app has a .metal file. Install it unless it is already there.
+      - name: Make sure the Metal toolchain is installed
+        run: |
+          if xcrun --sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain present"
+          else
+            xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+            xcrun --sdk iphoneos metal --version
+          fi
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen qemu
+          xcodegen --version
+          qemu-img --version | head -1
+
+      - name: Install Rust iOS target
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup target add aarch64-apple-ios
+
+      - name: Apply RoidOS name, icon, screens and identifiers
+        working-directory: husk
+        run: |
+          python3 "$GITHUB_WORKSPACE/roidos/rebrand.py" "$GITHUB_WORKSPACE/roidos/icons" \
+            --repo "$GITHUB_REPOSITORY" --build "$GITHUB_RUN_NUMBER"
+
+      # ToolbarContentBuilder only allows `if` from iOS 16, and the app deploys
+      # to 15.5. Moving the `if` inside the toolbar item means the same thing and
+      # compiles with every SDK. (The profile screen is unreachable in RoidOS,
+      # but the file still has to compile.)
+      - name: Adjust one toolbar for older SDKs
+        working-directory: husk
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("src/app/Husk/ProfileView.swift")
+          t = p.read_text()
+          old = ("                if account.signedIn {\n"
+                 "                    ToolbarItem(placement: .primaryAction) {\n")
+          new = ("                ToolbarItem(placement: .primaryAction) {\n"
+                 "                    if account.signedIn {\n")
+          if new in t:
+              print("already adjusted")
+          elif old in t:
+              p.write_text(t.replace(old, new, 1)); print("ProfileView: toolbar `if` moved inside the item")
+          else:
+              sys.exit("ProfileView.swift changed upstream; update this step")
+          PY
+
+      - name: Build the on-device pairing library (Rust)
+        working-directory: husk
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/build_rppairing_ios.sh
+
+      - name: Commit the RoidOS source of this build
+        id: rebrand
+        working-directory: husk
+        run: |
+          # The build stamps its commit into the app, and this commit is exactly
+          # the source that goes out with the IPA.
+          git add -A
+          git -c user.name="RoidOS build" -c user.email="roidos-build@users.noreply.github.com" \
+            commit -q -m "RoidOS build $GITHUB_RUN_NUMBER"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" src/app/Husk/Info.plist)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "RoidOS $VERSION from upstream ${{ inputs.upstream_ref }}, commit $(git rev-parse --short HEAD)"
+
+      - name: Package the source code of this build
+        run: |
+          mkdir -p out
+          git -C husk archive --format=zip --prefix=RoidOS-source/ -o "$GITHUB_WORKSPACE/out/RoidOS-source.zip" HEAD
+          ls -lh out/RoidOS-source.zip
+
+      - name: Get the engine libraries and Android runtime from the upstream release
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.upstream_ref }}"
+          case "$TAG" in
+            main|master) echo "::error::Upstream version must be a release tag such as 3.3, not '$TAG'"; exit 1 ;;
+          esac
+          URL="https://github.com/$UPSTREAM_REPO/releases/download/$TAG/Husk.ipa"
+          mkdir -p "$RUNNER_TEMP/upstream"
+          echo "downloading $URL"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/upstream/app.ipa" "$URL" \
+            || { echo "::error::No IPA published for release '$TAG' at $URL"; exit 1; }
+          ( cd "$RUNNER_TEMP/upstream" && unzip -q app.ipa )
+          APP="$RUNNER_TEMP/upstream/Payload/Husk.app"
+          echo "upstream app version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")"
+
+          H="$GITHUB_WORKSPACE/husk"
+          LIB="$H/build/ios-arm64/lib"
+          BIOS="$H/third_party/build/qemu-10.0.12-utm/pc-bios"
+          mkdir -p "$LIB" "$H/build/ios-arm64/sysroot/lib" "$H/guests/phase0" "$BIOS"
+
+          # Engines, embedded into the app by the Xcode project as-is.
+          cp "$APP/Frameworks/libqemu-aarch64-softmmu.dylib" "$APP/Frameworks/libhuskps4.dylib" "$LIB/"
+          cp "$APP/Frameworks/libANGLE-shared.dylib" "$H/build/ios-arm64/sysroot/lib/"
+          X="$LIB/MoltenVK.xcframework"
+          mkdir -p "$X/ios-arm64"
+          ditto "$APP/Frameworks/MoltenVK.framework" "$X/ios-arm64/MoltenVK.framework"
+          cat > "$X/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>AvailableLibraries</key>
+            <array>
+              <dict>
+                <key>BinaryPath</key><string>MoltenVK.framework/MoltenVK</string>
+                <key>LibraryIdentifier</key><string>ios-arm64</string>
+                <key>LibraryPath</key><string>MoltenVK.framework</string>
+                <key>SupportedArchitectures</key><array><string>arm64</string></array>
+                <key>SupportedPlatform</key><string>ios</string>
+              </dict>
+            </array>
+            <key>CFBundlePackageType</key><string>XFWK</string>
+            <key>XCFrameworkFormatVersion</key><string>1.0</string>
+          </dict>
+          </plist>
+          PLIST
+
+          # Android runtime for Java apps, and the system fonts/certificates for Flutter apps.
+          rsync -a "$APP/java-runtime/" "$H/build/java-runtime/"
+          rsync -a "$APP/android-system/" "$H/build/android-system/"
+
+          # Emulator boot files: kernel, initramfs, option ROMs and UEFI firmware.
+          cp "$APP/vmlinuz-virt" "$APP/initramfs-virt" "$H/guests/phase0/"
+          cp "$APP"/pc-bios/* "$BIOS/"
+          bzip2 -c "$APP/edk2-aarch64-code.fd" > "$BIOS/edk2-aarch64-code.fd.bz2"
+
+          du -sh "$H/build/ios-arm64/lib" "$H/build/java-runtime" "$H/build/android-system" "$H/guests/phase0"
+
+      - name: Build RoidOS
+        working-directory: husk
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          ./scripts/package_ipa.sh "$GITHUB_WORKSPACE/out/Husk.ipa"
+          ./scripts/package_ipa.sh --trollstore "$GITHUB_WORKSPACE/out/Husk.tipa"
+          mv "$GITHUB_WORKSPACE/out/Husk.ipa"  "$GITHUB_WORKSPACE/out/RoidOS.ipa"
+          mv "$GITHUB_WORKSPACE/out/Husk.tipa" "$GITHUB_WORKSPACE/out/RoidOS.tipa"
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      - name: Check the IPA is RoidOS
+        run: |
+          cd "$RUNNER_TEMP"
+          unzip -o -q "$GITHUB_WORKSPACE/out/RoidOS.ipa" "Payload/Husk.app/Info.plist"
+          P=Payload/Husk.app/Info.plist
+          NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" $P)
+          ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" $P)
+          VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" $P)
+          echo "Display name: $NAME   Bundle ID: $ID   Version: $VER"
+          [ "$NAME" = "RoidOS" ] && [ "$ID" = "com.roidos.app" ] && [ "$VER" = "${{ steps.rebrand.outputs.version }}" ]
+
+      - name: Upload IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoidOS-${{ steps.rebrand.outputs.version }}
+          path: |
+            out/RoidOS.ipa
+            out/RoidOS.tipa
+            out/RoidOS-source.zip
+          retention-days: 14
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roidos-build-log-${{ github.run_number }}
+          path: /tmp/husk_ipa/build.log
+          if-no-files-found: ignore
+
+      # The tag is the version number, which is what the app's update check
+      # compares against its own version.
+      - name: Publish GitHub Release
+        if: success() && inputs.publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.rebrand.outputs.version }}
+          name: RoidOS ${{ steps.rebrand.outputs.version }}
+          body: |
+            **RoidOS.ipa** — install with SideStore or AltStore (they sign it with your Apple ID).
+            **RoidOS.tipa** — for TrollStore only.
+            **RoidOS-source.zip** — the complete source code of this build. RoidOS is free software under the GNU GPL-2.0-or-later; the licence text is in the zip.
+          files: |
+            out/RoidOS.ipa
+            out/RoidOS.tipa
+            out/RoidOS-source.zip
