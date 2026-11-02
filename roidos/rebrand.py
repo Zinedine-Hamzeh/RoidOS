@@ -283,6 +283,40 @@ look("Husk/ContentView.swift", 'Label("Library", systemImage: "square.grid.2x2.f
 look("Husk/ContentView.swift", 'Label("Store", systemImage: "cart.fill")', 'Label("Play", systemImage: "bag.fill")', "tab store")
 look("Husk/ContentView.swift", 'Label("Settings", systemImage: "gearshape.fill")', 'Label("Tune", systemImage: "slider.horizontal.3")', "tab settings")
 
+# Logos: an app whose icon cannot be drawn (a vector one, as Edge's) gets a coloured tile with its first letter.
+look("Husk/TranslationLayer.swift", r'''                    drawn = iconEntry
+                }
+            }
+            try? "\(iconVersion)".write(''', r'''                    drawn = iconEntry
+                }
+            }
+            if drawn == "?" {
+                let word = info.label ?? "?"
+                let seed = word.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) % 360 }
+                let fmt = UIGraphicsImageRendererFormat()
+                fmt.scale = 1
+                let tile = UIGraphicsImageRenderer(size: CGSize(width: 288, height: 288), format: fmt).image { ctx in
+                    UIColor(hue: CGFloat(seed) / 360, saturation: 0.55, brightness: 0.75, alpha: 1).setFill()
+                    ctx.fill(CGRect(x: 0, y: 0, width: 288, height: 288))
+                    let letter = String(word.trimmingCharacters(in: .whitespaces).prefix(1)).uppercased() as NSString
+                    let attrs: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 150, weight: .bold), .foregroundColor: UIColor.white]
+                    let box = letter.size(withAttributes: attrs)
+                    letter.draw(at: CGPoint(x: (288 - box.width) / 2, y: (288 - box.height) / 2), withAttributes: attrs)
+                }
+                if let png = tile.pngData() {
+                    try? png.write(to: dir.appendingPathComponent("icon.png"))
+                    drawn = "letter tile"
+                }
+            }
+            try? "\(iconVersion)".write(''', "letter icon fallback")
+look("Husk/TranslationLayer.swift", "nonisolated static let iconVersion = 3", "nonisolated static let iconVersion = 4", "icon version")
+
+# iPad: phone apps open in a phone-sized window by default (Settings > Open Apps in Windows turns it off).
+look("Husk/AppWindows.swift", "UserDefaults.standard.bool(forKey: defaultKey) }",
+     "UserDefaults.standard.object(forKey: defaultKey) as? Bool ?? (UIDevice.current.userInterfaceIdiom == .pad) }", "windows default")
+look("Husk/SettingsTab.swift", "@AppStorage(AppWindows.defaultKey) private var multitask = false",
+     "@AppStorage(AppWindows.defaultKey) private var multitask = UIDevice.current.userInterfaceIdiom == .pad", "windows toggle default")
+
 # Layout fix for apps inside Android: the emulated 360 px screen was set to density 320 (a 180 dp-wide phone).
 # 160 makes it 360 dp wide, a normal phone, so app screens lay out properly.
 look("Husk/HuskBridgeFS.swift", """    func quietAbsentHardware() async {
